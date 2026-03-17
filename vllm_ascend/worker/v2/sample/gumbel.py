@@ -92,6 +92,28 @@ def gumbel_sample(
     apply_temperature: bool,
     processed_logits_out: torch.Tensor | None = None,  # [num_reqs, vocab_size]
 ) -> torch.Tensor:
+    if logits.device.type == "npu":
+        req_temp = temperature.index_select(0, idx_mapping).to(torch.float32)
+        scores = logits.to(torch.float32)
+
+        if apply_temperature:
+            safe_temp = torch.where(req_temp == 0, torch.ones_like(req_temp),
+                                    req_temp)
+            scores = scores / safe_temp.unsqueeze(-1)
+
+        nonzero_temp = req_temp != 0
+        if nonzero_temp.any():
+            # Triton argmax on NPU is currently unreliable for this path; use a
+            # torch fallback so greedy decoding and temperature sampling return
+            # real token ids instead of the invalid all-zero output.
+            noise = torch.rand_like(scores[nonzero_temp]).clamp_(1e-6,
+                                                                 1 - 1e-6)
+            gumbel_noise = -torch.log(-torch.log(noise))
+            scores = scores.clone()
+            scores[nonzero_temp] = scores[nonzero_temp] + gumbel_noise
+
+        return scores.argmax(dim=-1).to(torch.int64)
+
     num_reqs, vocab_size = logits.shape
     BLOCK_SIZE = 1024
     num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
