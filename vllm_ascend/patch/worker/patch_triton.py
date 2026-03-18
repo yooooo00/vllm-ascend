@@ -176,70 +176,96 @@ def _chunk_scan_fwd_npu(
             nheads // ngroups,
             rounding_mode="floor",
         )
-        seq_ids = seq_idx.detach().cpu().tolist()
-        chunk_offsets = cu_chunk_seqlens.detach().cpu().tolist()
-        dA_all = dA_cumsum.to(torch.float32)
-        dt_all = dt.to(torch.float32)
+        seq_ids = seq_idx.to(torch.long)
+        chunk_offsets = cu_chunk_seqlens.to(torch.long)
+        chunk_lengths = chunk_offsets[1:] - chunk_offsets[:-1]
+        dA_all = dA_cumsum.to(torch.float32).permute(1, 0, 2).contiguous()
+        dt_all = dt.to(torch.float32).permute(1, 0, 2).contiguous()
+        x_all = x.to(torch.float32)
+        C_all = C.index_select(1, head_to_group).to(torch.float32)
+        states_all = states.to(torch.float32)
+        x_chunks = x_all.new_zeros((nchunks, chunk_size, nheads, headdim))
+        C_chunks = C_all.new_zeros((nchunks, chunk_size, nheads, dstate))
+        z_chunks = z.to(torch.float32).new_zeros(
+            (nchunks, chunk_size, nheads, headdim)) if z is not None else None
         D_fp32 = D.to(torch.float32) if D is not None else None
-        causal_cache = {}
+        cb_all = cb.index_select(1, head_to_group).to(torch.float32)
+        row_idx = torch.arange(chunk_size, device=x.device)
+        causal = torch.tril(
+            torch.ones(chunk_size, chunk_size, device=x.device,
+                       dtype=torch.bool))
+        valid_rows = row_idx.unsqueeze(0) < chunk_lengths.unsqueeze(1)
+        valid_causal = valid_rows[:, :, None] & valid_rows[:, None, :] & causal.unsqueeze(0)
 
-        for chunk_idx, seq_id in enumerate(seq_ids):
-            token_start = chunk_offsets[chunk_idx]
-            token_end = chunk_offsets[chunk_idx + 1]
+        for chunk_idx in range(nchunks):
+            token_start = int(chunk_offsets[chunk_idx].item())
+            token_end = int(chunk_offsets[chunk_idx + 1].item())
             if token_end <= token_start:
                 continue
-
             token_count = token_end - token_start
-            x_chunk = x[token_start:token_end].to(torch.float32)
-            dA_chunk = dA_all[:, chunk_idx, :token_count]
-            dt_chunk = dt_all[:, chunk_idx, :token_count]
-            cb_chunk = cb[chunk_idx].index_select(0, head_to_group)[
-                :, :token_count, :token_count
-            ].to(torch.float32)
+            x_chunks[chunk_idx, :token_count].copy_(x_all[token_start:token_end])
+            C_chunks[chunk_idx, :token_count].copy_(C_all[token_start:token_end])
+            if z_chunks is not None:
+                z_chunks[chunk_idx, :token_count].copy_(z[token_start:token_end].to(torch.float32))
 
-            if token_count not in causal_cache:
-                causal_cache[token_count] = torch.tril(
-                    torch.ones(token_count,
-                               token_count,
-                               device=x.device,
-                               dtype=torch.float32))
-            causal = causal_cache[token_count]
-            delta = dA_chunk[:, :, None] - dA_chunk[:, None, :]
-            # For masked future positions, exp(delta) can overflow and then turn
-            # into NaN when multiplied by the zero causal mask. Zero those entries
-            # before exponentiation and clamp valid deltas to the causal range.
-            delta = torch.where(causal.bool().unsqueeze(0), delta,
-                                torch.zeros_like(delta))
-            delta = torch.minimum(delta, torch.zeros_like(delta))
-            coeff = cb_chunk * torch.exp(delta) * dt_chunk[:, None, :] * causal.unsqueeze(0)
-            x_by_head = x_chunk.transpose(0, 1)
-            acc = torch.einsum("hmk,hkd->hmd", coeff, x_by_head).transpose(0, 1)
+        delta = dA_all.unsqueeze(-1) - dA_all.unsqueeze(-2)
+        # For masked future positions, exp(delta) can overflow and then turn
+        # into NaN when multiplied by the zero causal mask. Zero those entries
+        # before exponentiation and clamp valid deltas to the causal range.
+        delta.masked_fill_(~valid_causal.unsqueeze(1), 0)
+        delta.clamp_max_(0)
+        coeff = cb_all * torch.exp(delta)
+        coeff.mul_(dt_all.unsqueeze(-2))
+        coeff.mul_(valid_causal.unsqueeze(1))
 
-            prev_states = None
-            if chunk_idx == 0 or seq_id != seq_ids[chunk_idx - 1]:
-                if initial_states is not None:
-                    prev_states = initial_states[seq_id].to(torch.float32)
+        x_by_head = x_chunks.permute(0, 2, 1, 3).reshape(-1, chunk_size, headdim)
+        acc = torch.bmm(coeff.reshape(-1, chunk_size, chunk_size), x_by_head)
+        acc = acc.reshape(nchunks, nheads, chunk_size, headdim).permute(0, 2, 1, 3)
+
+        prev_states = states_all.new_zeros((nchunks, nheads, headdim, dstate))
+        if initial_states is not None:
+            initial_states_all = initial_states.to(torch.float32)
+            prev_states[0] = initial_states_all[seq_ids[0]]
+        if nchunks > 1:
+            prev_chunk_mask = seq_ids[1:] == seq_ids[:-1]
+            prev_chunk_indices = torch.nonzero(prev_chunk_mask, as_tuple=False).flatten()
+            if prev_chunk_indices.numel() > 0:
+                prev_states[prev_chunk_indices + 1] = states_all[prev_chunk_indices]
+            if initial_states is not None:
+                boundary_indices = torch.nonzero(~prev_chunk_mask,
+                                                as_tuple=False).flatten()
+                if boundary_indices.numel() > 0:
+                    prev_states[boundary_indices + 1] = initial_states_all[
+                        seq_ids[boundary_indices + 1]
+                    ]
+
+        prev_term = torch.bmm(
+            C_chunks.permute(0, 2, 1, 3).reshape(-1, chunk_size, dstate),
+            prev_states.reshape(-1, headdim, dstate).transpose(1, 2).contiguous(),
+        )
+        prev_term = prev_term.reshape(nchunks, nheads, chunk_size,
+                                      headdim).permute(0, 2, 1, 3)
+        prev_term.mul_(torch.exp(dA_all).permute(0, 2, 1).unsqueeze(-1))
+        acc.add_(prev_term)
+
+        if D_fp32 is not None:
+            if D_fp32.dim() == 1:
+                acc.add_(x_chunks * D_fp32.view(1, 1, nheads, 1))
             else:
-                prev_states = states[chunk_idx - 1].to(torch.float32)
+                acc.add_(x_chunks * D_fp32.view(1, 1, nheads, headdim))
 
-            if prev_states is not None:
-                c_chunk = C[token_start:token_end].index_select(
-                    1, head_to_group).to(torch.float32)
-                prev_term = torch.einsum("thk,hdk->thd", c_chunk, prev_states)
-                acc = acc + prev_term * torch.exp(
-                    dA_chunk.transpose(0, 1)).unsqueeze(-1)
+        if z_chunks is not None:
+            z_gate = z_chunks * torch.sigmoid(z_chunks)
+            acc.mul_(z_gate)
 
-            if D_fp32 is not None:
-                if D_fp32.dim() == 1:
-                    acc = acc + x_chunk * D_fp32.view(1, nheads, 1)
-                else:
-                    acc = acc + x_chunk * D_fp32.unsqueeze(0)
+        for chunk_idx in range(nchunks):
+            token_start = int(chunk_offsets[chunk_idx].item())
+            token_end = int(chunk_offsets[chunk_idx + 1].item())
+            if token_end <= token_start:
+                continue
+            token_count = token_end - token_start
+            out[token_start:token_end].copy_(acc[chunk_idx, :token_count].to(out.dtype))
 
-            if z is not None:
-                z_chunk = z[token_start:token_end].to(torch.float32)
-                acc = acc * (z_chunk * torch.sigmoid(z_chunk))
-
-            out[token_start:token_end].copy_(acc.to(out.dtype))
         _debug_mamba_io(
             "chunk_scan",
             {
