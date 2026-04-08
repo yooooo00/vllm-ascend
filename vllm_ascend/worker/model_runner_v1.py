@@ -2158,14 +2158,16 @@ class NPUModelRunner(GPUModelRunner):
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
         self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
 
+        num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs_padded]
+        num_prompt_tokens_cpu = self.input_batch.num_prompt_tokens_cpu_tensor[:num_reqs_padded]
+        is_prefilling = num_computed_tokens_cpu < num_prompt_tokens_cpu
+
         cm_base = AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
             seq_lens=self.seq_lens[:num_reqs_padded],
-            # TODO
             seq_lens_cpu=self.optimistic_seq_lens_cpu[:num_reqs_padded],
-            # TODO
-            num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs_padded],
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
             num_reqs=num_reqs_padded,
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,
@@ -2173,6 +2175,7 @@ class NPUModelRunner(GPUModelRunner):
             block_table_tensor=block_table_gid_0,
             slot_mapping=slot_mapping_gid_0,
             causal=True,
+            is_prefilling=is_prefilling,
             num_input_tokens=num_tokens_padded,
             actual_seq_lengths_q=self.actual_seq_lengths_q,
             positions=self.positions,

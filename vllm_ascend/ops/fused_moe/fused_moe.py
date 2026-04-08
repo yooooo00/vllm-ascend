@@ -32,6 +32,7 @@ from vllm.model_executor.layers.fused_moe.layer import FusedMoE, UnquantizedFuse
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import FusedMoERouter  # type: ignore
 from vllm.model_executor.layers.fused_moe.runner.default_moe_runner import DefaultMoERunner  # type: ignore
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExpertsOrder
 from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 
 import vllm_ascend.envs as envs_ascend
@@ -81,6 +82,14 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         super().__init__(moe=moe)
         self.dynamic_eplb = get_ascend_config().eplb_config.dynamic_eplb
 
+    @property
+    def is_monolithic(self) -> bool:
+        # Ascend uses the modular MoE kernel path on current vLLM main.
+        # Keep this independent from experts_cls during layer construction,
+        # because main now queries is_monolithic before the backend-specific
+        # kernel object is fully materialized.
+        return False
+
     def process_weights_after_loading(self, layer):
         super(UnquantizedFusedMoEMethod, self).process_weights_after_loading(layer)
 
@@ -107,42 +116,20 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        use_grouped_topk: bool,
-        top_k: int,
-        router_logits: torch.Tensor,
-        renormalize: bool,
-        topk_group: int | None = None,
-        num_expert_group: int | None = None,
-        custom_routing_function: Callable | None = None,
-        scoring_func: str = "softmax",
-        routed_scaling_factor: float = 1.0,
-        e_score_correction_bias: torch.Tensor | None = None,
-        global_num_experts: int = -1,
-        expert_map: torch.Tensor | None = None,
-        apply_router_weight_on_input: bool = False,
-        activation: str = "silu",
-        enable_force_load_balance: bool = False,
-        log2phy: torch.Tensor = None,
-        global_redundant_expert_num: int = 0,
-        pertoken_scale: torch.Tensor | None = None,
-        mc2_mask: torch.Tensor | None = None,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        zero_expert_num = getattr(layer, "zero_expert_num", 0)
-        zero_expert_type = getattr(layer, "zero_expert_type", None)
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            top_k=top_k,
-            use_grouped_topk=use_grouped_topk,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            routed_scaling_factor=routed_scaling_factor,
-            e_score_correction_bias=e_score_correction_bias,
-            global_num_experts=global_num_experts,
-        )
+        del shared_experts_input
+        expert_map = layer.expert_map
+        global_num_experts = layer.global_num_experts
+        apply_router_weight_on_input = layer.apply_router_weight_on_input
+        activation = layer.activation
+        log2phy = getattr(layer, "log2phy", None)
+        global_redundant_expert_num = getattr(layer, "global_redundant_expert_num", 0)
+        pertoken_scale = getattr(layer, "pertoken_scale", None)
+        mc2_mask = getattr(layer, "mc2_mask", None)
+
         if layer.vllm_config.model_config is not None and layer.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -151,34 +138,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     topk_ids=topk_ids,
                 )
 
-        if zero_expert_num > 0 and zero_expert_type is not None:
-            topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
-                expert_indices=topk_ids,
-                expert_scales=topk_weights,
-                num_experts=global_num_experts,
-                zero_expert_type=zero_expert_type,
-                hidden_states=x,
-            )
-
         topk_weights = topk_weights.to(x.dtype)
-        # this is a naive implementation for experts load balance so as
-        # to avoid accumulating too much tokens on a single rank.
-        # currently it is only activated when doing profile runs.
-        if enable_force_load_balance:
-            random_matrix = torch.rand(topk_ids.size(0), global_num_experts, device=topk_ids.device)
-            topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
-
         moe_comm_method = _EXTRA_CTX.moe_comm_method
-        # NOTE: In the MoECommType.FUSED_MC2 branch, we wrap weights (w1, w2) into lists
-        # and provide dummy scales (w1_scale, w2_scale). This is required because:
-        # The underlying Ascend fused operator (e.g., dispatch_ffn_combine) expects
-        # inputs in a list format.
-        # TODO: Passing an empty tensor as scale for float (BF16) cases is semantically
-        # incorrect. The ideal solution is to pass None. However, if the underlying
-        # dispatch_ffn_combine C++ operator does not support None for the scale argument
-        # (due to signature constraints), we are forced to use a placeholder empty tensor.
-        # This TODO tracks the requirement to update the C++ operator to accept Optional[Tensor]
-        # or None for scales in non-quantized scenarios.
         if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
             w1 = [layer.w13_weight]
             w1_scale = [torch.tensor([], dtype=torch.int64)]
@@ -190,7 +151,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             w2 = layer.w2_weight
             w2_scale = None
 
-        final_hidden_states = moe_comm_method.fused_experts(
+        result = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
                 topk_weights=topk_weights,
@@ -208,13 +169,16 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 log2phy=log2phy,
                 pertoken_scale=pertoken_scale,
                 activation=activation,
+                # process_weights_after_loading already converts Nemotron's
+                # expert weights to the grouped-matmul-friendly [E, K, N]
+                # layout on Ascend. The current vLLM modular MoE path should
+                # consume them directly instead of transposing them again.
+                need_trans=False,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
             )
         )
-        if zero_expert_num > 0 and zero_expert_type is not None:
-            final_hidden_states += zero_expert_result
-        return final_hidden_states
+        return result.routed_out
 
 
 # Please remove this inheritance after extending vllm, todo(wxs)
@@ -281,16 +245,16 @@ class AscendMoERunner(DefaultMoERunner):
         router_logits: torch.Tensor,
         shared_input: torch.Tensor | None,
     ):
-        """
-        Override the default forward_impl to use Ascend-specific implementation.
-        This delegates to the layer's forward_impl method which contains the
-        Ascend-specific MoE computation logic.
-        """
-        result = layer.forward_impl(hidden_states, router_logits)
-        # If the layer has shared experts, forward_impl returns a tuple (shared_out, routed_out)
-        # Otherwise, it returns just routed_out
-        # The torch op expects the same return type based on whether it's moe_forward or moe_forward_shared
-        return result
+        if self.shared_experts is None:
+            return layer.forward_impl(hidden_states, router_logits)
+
+        assert shared_input is not None
+        self._maybe_apply_shared_experts(shared_input, SharedExpertsOrder.NO_OVERLAP)
+        routed_out = layer.forward_impl(hidden_states, router_logits)
+        self._maybe_apply_shared_experts(
+            shared_input, SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+        )
+        return self.shared_experts.output, routed_out
 
 
 class AscendFusedMoE(FusedMoE):
@@ -392,13 +356,15 @@ class AscendFusedMoE(FusedMoE):
         # Storing the runner in the FusedMoE is an intermediate state, eventually
         # the runner will own the FusedMoE layer and provide the execution interface
         # for MoE ops.
+        shared_experts = getattr(self, "_shared_experts", None)
+        gate = getattr(self, "_gate", None) if hasattr(self, "_gate") else self.gate
         return AscendMoERunner(
             layer=self,
             moe_config=self.moe_config,
             router=self.router,
             routed_input_transform=self._routed_input_transform,
-            gate=self.gate,
-            shared_experts=self.shared_experts,
+            gate=gate,
+            shared_experts=shared_experts,
             quant_method=self.quant_method,
             reduce_results=self.reduce_results,
             enable_dbo=self.vllm_config.parallel_config.enable_dbo,
@@ -590,6 +556,13 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         **kwargs,
     ):
         ascend_config = get_ascend_config()
+        # AscendFusedMoE.__init__ eagerly constructs the runner via
+        # self._init_runner(). Seed shared-expert state before that happens so
+        # property lookups from the mixed-in SharedFusedMoE path do not fail
+        # on current vLLM main.
+        object.__setattr__(self, "_shared_experts", shared_experts)
+        object.__setattr__(self, "_gate", gate)
+        object.__setattr__(self, "use_overlapped", use_overlapped)
         # TODO: Enabling the mix placement in deepseek_v2.py
         # remove this part after the mix placement merged into vllm
         # https://github.com/vllm-project/vllm/pull/31256
@@ -603,7 +576,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
 
         self._routed_input_transform = routed_input_transform
         self._shared_experts = shared_experts
-        self.use_overlapped = use_overlapped
+        self._gate = gate
         self.shared_expert_stream = None
         self.multistream_overlap_shared_expert = (
             ascend_config.multistream_overlap_shared_expert and self._shared_experts is not None
@@ -612,7 +585,6 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         if enable_sp():
             logger.info_once("Sequence parallelism is enabled, shared experts are replicated for best performance.")
 
-        self._gate = gate
         # Recreate the runner with the correct shared_experts parameter
         # The parent class created the runner before self._shared_experts was set
         self.runner = self._init_runner()
@@ -695,20 +667,14 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._shared_experts is None:
-            fused_out = AscendFusedMoE.forward(
-                self,
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-            )
-            shared_out = None
-            return shared_out, fused_out
-        shared_out, fused_out = AscendFusedMoE.forward(
+        result = AscendFusedMoE.forward(
             self,
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
-        return shared_out, fused_out
+        if self._shared_experts is None:
+            return None, result
+        return result
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor, fused_moe_evts: FusedMoEEvents):
         if self._shared_experts is None:
