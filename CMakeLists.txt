@@ -21,7 +21,8 @@ set(VLLM_ASCEND_INSTALL_PATH "${CMAKE_INSTALL_PREFIX}")
 find_package(Torch REQUIRED)
 
 run_python(TORCH_VERSION
-  "import torch; print(torch.__version__)" "Failed to locate torch path")
+  "import os; import re; import sys; saved_out = os.dup(1); saved_err = os.dup(2); devnull = os.open(os.devnull, os.O_WRONLY); os.dup2(devnull, 1); os.dup2(devnull, 2); import torch; os.dup2(saved_out, 1); os.dup2(saved_err, 2); os.close(saved_out); os.close(saved_err); os.close(devnull); m = re.search(r'[0-9]+\\.[0-9]+\\.[0-9]+', torch.__version__); print(m.group(0) if m else torch.__version__)"
+  "Failed to locate torch path")
 # check torch version is 2.9.0
 if(NOT ${TORCH_VERSION} VERSION_EQUAL "2.9.0")
   message(FATAL_ERROR "Expected PyTorch version 2.9.0, but found ${TORCH_VERSION}")

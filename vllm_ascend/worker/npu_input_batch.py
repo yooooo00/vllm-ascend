@@ -179,6 +179,9 @@ class NPUInputBatch(InputBatch):
         self.generators: dict[int, torch.Generator] = {}
 
         self.num_logprobs: dict[str, int] = {}
+        # Keep parity with upstream InputBatch so inherited sampling metadata
+        # builders can handle explicit token logprob requests.
+        self.logprob_token_ids: dict[str, list[int]] = {}
 
         # To accumulate prompt logprobs tensor chunks across prefill steps.
         self.in_progress_prompt_logprobs_cpu: dict[str, LogprobsTensors] = {}

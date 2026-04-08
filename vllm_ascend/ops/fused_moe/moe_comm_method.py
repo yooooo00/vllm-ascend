@@ -158,7 +158,39 @@ class MoECommMethod(ABC):
         )
 
     def _apply_mlp(self, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
-        return unified_apply_mlp(mlp_compute_input=mlp_compute_input)
+        quant_kwargs = {}
+        if mlp_compute_input.quant.mxfp is not None:
+            quant_kwargs.update(
+                act_quant_type=mlp_compute_input.quant.mxfp.act_quant_type,
+                weight_quant_type=mlp_compute_input.quant.mxfp.weight_quant_type,
+                scale_dtype=mlp_compute_input.quant.mxfp.scale_dtype,
+                per_token_scale_dtype=mlp_compute_input.quant.mxfp.per_token_scale_dtype,
+                use_bf16=mlp_compute_input.quant.mxfp.use_bf16,
+            )
+
+        return unified_apply_mlp(
+            hidden_states=mlp_compute_input.hidden_states,
+            w1=mlp_compute_input.weights.w1,
+            w2=mlp_compute_input.weights.w2,
+            group_list=mlp_compute_input.group_list,
+            w1_scale=mlp_compute_input.weights.w1_scale,
+            w2_scale=mlp_compute_input.weights.w2_scale,
+            activation=mlp_compute_input.activation,
+            w1_bias=mlp_compute_input.weights.w1_bias,
+            w2_bias=mlp_compute_input.weights.w2_bias,
+            dynamic_scale=mlp_compute_input.dynamic_scale,
+            group_list_type=mlp_compute_input.group_list_type,
+            w1_scale_bias=mlp_compute_input.weights.w1_scale_bias,
+            w2_scale_bias=mlp_compute_input.weights.w2_scale_bias,
+            w1_offset=mlp_compute_input.weights.w1_offset,
+            w2_offset=mlp_compute_input.weights.w2_offset,
+            topk_scales=mlp_compute_input.topk_scales,
+            with_quant=mlp_compute_input.quant.is_quant,
+            fusion=mlp_compute_input.fusion,
+            need_trans=mlp_compute_input.need_trans,
+            dynamic_eplb=mlp_compute_input.dynamic_eplb,
+            **quant_kwargs,
+        )
 
     @abstractmethod
     def _get_token_dispatcher(self) -> MoETokenDispatcher:

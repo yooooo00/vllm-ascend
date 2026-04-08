@@ -357,75 +357,68 @@ def _chunk_scan_fwd_npu(
 def _state_passing_fwd_npu(
     states,
     dA_cumsum,
-    cu_chunk_seqlens,
-    seq_idx,
+    last_chunk_indices,
     initial_states=None,
     out_dtype=None,
 ):
-    if (states.device.type != "npu" or seq_idx is None or states.shape[0] <= 1
+    if (states.device.type != "npu"
             or os.getenv("VLLM_ASCEND_DISABLE_STATE_PASSING_FALLBACK") == "1"):
         return _ORIGINAL_STATE_PASSING_FWD(
             states,
             dA_cumsum,
-            cu_chunk_seqlens,
-            seq_idx,
+            last_chunk_indices,
             initial_states=initial_states,
             out_dtype=out_dtype,
         )
 
     nchunks, nheads, dim = states.shape
     chunk_size = dA_cumsum.shape[-1]
+    batch = int(last_chunk_indices.shape[0])
+    assert dA_cumsum.shape == (nheads, nchunks, chunk_size)
+
     _debug_mamba_io(
         "state_passing",
         {
             "device": states.device.type,
-            "seqlen": int(cu_chunk_seqlens[-1].item()) if cu_chunk_seqlens is not None else None,
             "nchunks": int(nchunks),
             "nheads": int(nheads),
             "dim": int(dim),
             "chunk_size": int(chunk_size),
+            "batch": batch,
             "has_initial_states": initial_states is not None,
-            "seq_ids_head": seq_idx[: min(8, seq_idx.numel())].detach().cpu().tolist() if seq_idx is not None else None,
+            "last_chunk_indices": last_chunk_indices[: min(8, last_chunk_indices.numel())].detach().cpu().tolist(),
             "states_absmax": float(states.detach().abs().max().cpu()),
             "initial_absmax": float(initial_states.detach().abs().max().cpu()) if initial_states is not None else None,
             "dA_last_min": float(dA_cumsum[:, :, -1].detach().min().cpu()),
             "dA_last_max": float(dA_cumsum[:, :, -1].detach().max().cpu()),
         },
     )
-    assert dA_cumsum.shape == (nheads, nchunks, chunk_size)
 
     out_dtype = states.dtype if out_dtype is None else out_dtype
-    carry = (
-        initial_states[0].to(torch.float32)
-        if initial_states is not None
-        else torch.zeros((nheads, dim), device=states.device, dtype=torch.float32)
-    )
-    zero_carry = torch.zeros_like(carry)
     out = torch.empty((nchunks, nheads, dim), device=states.device, dtype=torch.float32)
-    seq_ids = seq_idx.detach().cpu().tolist()
+    states_fp32 = states.to(torch.float32)
+    last_chunk_indices_cpu = last_chunk_indices.to(torch.long).detach().cpu().tolist()
+    initial_states_fp32 = initial_states.to(torch.float32) if initial_states is not None else None
+    zero_carry = torch.zeros((nheads, dim), device=states.device, dtype=torch.float32)
 
-    prev_seq_idx = 0
-    for chunk_idx, cur_seq_idx in enumerate(seq_ids):
-        if cur_seq_idx != prev_seq_idx:
-            carry = (
-                initial_states[cur_seq_idx].to(torch.float32)
-                if initial_states is not None
-                else zero_carry
-            )
-        prev_seq_idx = cur_seq_idx
-        decay = torch.exp(dA_cumsum[:, chunk_idx, -1]).to(torch.float32).unsqueeze(-1)
-        carry = decay * carry + states[chunk_idx].to(torch.float32)
-        out[chunk_idx] = carry
+    chunk_start = 0
+    for batch_idx, chunk_end in enumerate(last_chunk_indices_cpu):
+        carry = initial_states_fp32[batch_idx] if initial_states_fp32 is not None else zero_carry
+        for chunk_idx in range(chunk_start, int(chunk_end) + 1):
+            decay = torch.exp(dA_cumsum[:, chunk_idx, -1]).to(torch.float32).unsqueeze(-1)
+            carry = decay * carry + states_fp32[chunk_idx]
+            out[chunk_idx] = carry
+        chunk_start = int(chunk_end) + 1
 
     _debug_mamba_io(
         "state_passing",
         {
             "device": states.device.type,
-            "seqlen": int(cu_chunk_seqlens[-1].item()) if cu_chunk_seqlens is not None else None,
             "nchunks": int(nchunks),
             "nheads": int(nheads),
             "dim": int(dim),
             "chunk_size": int(chunk_size),
+            "batch": batch,
             "has_initial_states": initial_states is not None,
             "result_absmax": float(out.detach().abs().max().cpu()),
             "result_nonfinite": int((~torch.isfinite(out)).sum().detach().cpu()),

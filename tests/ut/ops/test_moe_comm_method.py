@@ -258,11 +258,15 @@ class TestMoECommMethod(TestBase):
         # Verify token_dispatch was called
         mock_td_instance.token_dispatch.assert_called_once()
 
-        # Verify unified_apply_mlp was called
+        # Verify unified_apply_mlp was called with unpacked MLP compute inputs
         mock_unified_apply_mlp.assert_called_once()
-        mlp_compute_input = mock_unified_apply_mlp.call_args.kwargs["mlp_compute_input"]
-        self.assertFalse(mlp_compute_input.fusion)
-        self.assertFalse(mlp_compute_input.quant.is_mxfp)
+        kwargs = mock_unified_apply_mlp.call_args.kwargs
+        self.assertIn("hidden_states", kwargs)
+        self.assertIn("w1", kwargs)
+        self.assertIn("w2", kwargs)
+        self.assertIn("group_list", kwargs)
+        self.assertFalse(kwargs["fusion"])
+        self.assertFalse(kwargs["with_quant"])
 
         # Verify token_combine was called
         mock_td_instance.token_combine.assert_called_once_with(

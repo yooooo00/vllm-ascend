@@ -181,16 +181,14 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_actual_tokens=num_actual_tokens,
             max_query_len=self.max_query_len,
             decode_token_per_req=self.decode_token_per_req,
-            # NOTE: keep all tokens for block_table_tensor and slot_mapping otherwise
-            # there will be error about shape mismatch during reshape and cache.
-            # This is really strange since vLLM slices them as well
             block_table_tensor=self.block_table_tensor,
             slot_mapping=self.slot_mapping,
             causal=self.causal,
+            is_prefilling=self.is_prefilling[:num_actual_reqs] if self.is_prefilling is not None else None,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
             positions=self.positions,
             attn_state=self.attn_state,
-            graph_pad_size=-1,  # It should be -1 when not run in fullgraph mode.
+            graph_pad_size=-1,
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
             max_seq_len=self.max_seq_len,

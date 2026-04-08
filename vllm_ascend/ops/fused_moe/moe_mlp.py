@@ -341,6 +341,8 @@ def unquant_apply_mlp(
     topk_scales: torch.Tensor | None = None,
     need_trans: bool = True,
 ) -> torch.Tensor:
+    activation_name = getattr(activation, "value", activation)
+
     if need_trans:
         w1 = w1.transpose(1, 2)
         w2 = w2.transpose(1, 2)
@@ -355,14 +357,14 @@ def unquant_apply_mlp(
         group_list=group_list,
     )[0]
 
-    if activation == "swigluoai":
+    if activation_name == "swigluoai":
         num_experts, _, hidden_size = w1.shape
         gate_up_out = AscendSwigluOAIAndMul.swiglu_oai_forward(gate_up_out.view(-1, hidden_size))
-    elif activation == SILU_NO_MUL:
+    elif activation_name == SILU_NO_MUL:
         gate_up_out = F.silu(gate_up_out)
-    elif activation == GELU_NO_MUL:
+    elif activation_name == GELU_NO_MUL:
         gate_up_out = F.gelu(gate_up_out)
-    elif activation == RELU2_NO_MUL:
+    elif activation_name in {RELU2_NO_MUL, "relu2"}:
         gate_up_out = torch.square(F.relu(gate_up_out))
     else:
         gate_up_out = torch_npu.npu_swiglu(gate_up_out)
