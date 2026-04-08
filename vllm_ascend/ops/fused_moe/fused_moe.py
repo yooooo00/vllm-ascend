@@ -633,7 +633,12 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             self.quant_method.process_weights_after_loading = wrapped_process_weights  # type: ignore
 
     def _shared_experts_part1(self, hidden_states: torch.Tensor):
-        shared_gate_up, _ = self._shared_experts.gate_up_proj(hidden_states)  # type: ignore
+        # NemotronH shared experts use a plain `up_proj` MLP instead of the
+        # usual gated `gate_up_proj` module.
+        proj = getattr(self._shared_experts, "gate_up_proj", None)
+        if proj is None:
+            proj = getattr(self._shared_experts, "up_proj")
+        shared_gate_up, _ = proj(hidden_states)  # type: ignore
         return shared_gate_up
 
     def _shared_experts_part2(self, hidden_states: torch.Tensor, shared_gate_up: torch.Tensor):
@@ -763,8 +768,9 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             assert fc3_context is not None
             shared_out = fc3_context.shared_out
         else:
+            shared_input = self._get_shared_experts_input(hidden_states)
             shared_out = self._forward_shared_experts(
-                hidden_states,
+                shared_input,
                 FusedMoEEvents(
                     before_routed_experts=before_routed_experts,
                     before_dispatch=fused_moe_results.before_dispatch_evt,

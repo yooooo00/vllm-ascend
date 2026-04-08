@@ -66,6 +66,11 @@ def causal_conv1d_fn(
     conv_states: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     cache_indices: torch.Tensor | None = None,
+    block_idx_first_scheduled_token: torch.Tensor | None = None,
+    block_idx_last_scheduled_token: torch.Tensor | None = None,
+    initial_state_idx: torch.Tensor | None = None,
+    num_computed_tokens: torch.Tensor | None = None,
+    block_size_to_align: int | None = None,
     query_start_loc: torch.Tensor | None = None,
     metadata: Any | None = None,
     pad_slot_id: int = PAD_SLOT_ID,
@@ -125,10 +130,26 @@ def causal_conv1d_fn(
         if pcp_rank > 0:
             conv_states[cache_indices[num_decodes:]] = all_last_width_prefill_x[pcp_rank - 1, ...]
 
+    # NemotronH prefill on newer vLLM call sites passes APC-related kwargs here.
+    # The Ascend fallback kernel does not implement that cache layout yet, but
+    # plain prefill/decode works as long as we accept and ignore them.
+    _ = (
+        block_idx_first_scheduled_token,
+        block_idx_last_scheduled_token,
+        initial_state_idx,
+        num_computed_tokens,
+        block_size_to_align,
+        metadata,
+    )
+
     for i in range(len(seqlens)):
         x_s = splits[i]
-        if cache_indices[i] == PAD_SLOT_ID:
+        cache_idx = int(cache_indices[i])
+        if cache_idx == PAD_SLOT_ID:
             continue
+        initial_states = None
+        if has_initial_state is None or bool(has_initial_state[i]):
+            initial_states = conv_states[cache_idx][..., : (width - 1)]
         out_ref_b.append(
             causal_conv1d_ref(
                 x_s,
@@ -136,8 +157,8 @@ def causal_conv1d_fn(
                 bias,
                 activation=activation,
                 return_final_states=True,
-                final_states_out=conv_states[cache_indices[i]][..., : (width - 1)].unsqueeze(0),
-                initial_states=conv_states[cache_indices[i]][..., : (width - 1)],
+                final_states_out=conv_states[cache_idx][..., : (width - 1)].unsqueeze(0),
+                initial_states=initial_states,
             )
         )
 
