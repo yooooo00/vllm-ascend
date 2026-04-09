@@ -32,6 +32,7 @@ GLM4.x.md
 GLM5.md
 Kimi-K2-Thinking.md
 Kimi-K2.5.md
+NVIDIA-Nemotron-3-Super.md
 PaddleOCR-VL.md
 MiniMax-M2.5.md
 :::

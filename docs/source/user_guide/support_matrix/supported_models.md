@@ -53,6 +53,7 @@ Get the latest info here: <https://github.com/vllm-project/vllm-ascend/issues/16
 | Gemma-3                       | 🔵        |                                                                      | A2/A3 |
 | Phi-3/4                       | 🔵        |                                                                      | A2/A3 |
 | Mistral/Mistral-Instruct      | 🔵        |                                                                      | A2/A3 |
+| NVIDIA Nemotron 3 Super      | 🔵        | Functionally validated in eager and FULL_DECODE_ONLY graph modes; see [tutorial](../../tutorials/models/NVIDIA-Nemotron-3-Super.md) | A2 |
 | DeepSeek V2.5                 | 🟡        | Need test                                                            |       |
 | Mllama                        | 🟡        | Need test                                                            |       |
 | MiniMax-Text                  | 🟡        | Need test                                                            |       |
