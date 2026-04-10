@@ -217,8 +217,8 @@ merged branch and record the benchmark configuration together with the result.
 
 ## Performance
 
-This port includes only a small graph-mode sanity benchmark, not a full tuning
-pass.
+This port includes service-level benchmark evidence for the validated graph-mode
+configuration, but it is still not a full tuning pass.
 
 Validated benchmark command:
 
@@ -231,22 +231,27 @@ vllm bench serve \
   --model nemotron-super \
   --tokenizer /models/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
   --dataset-name random \
-  --num-prompts 4 \
+  --num-prompts 8 \
   --max-concurrency 2 \
-  --random-input-len 256 \
-  --random-output-len 64 \
+  --random-input-len 2100 \
+  --random-output-len 900 \
   --ignore-eos \
   --trust-remote-code
 ```
 
-Observed result on the validated A2 setup:
+Observed results on the validated A2 setup:
 
-| Metric | Value |
-|--------|-------|
-| Output throughput | `18.98 tok/s` |
-| Total throughput | `94.91 tok/s` |
-| Mean TTFT | `4788.07 ms` |
-| Mean TPOT | `30.85 ms` |
+| Scenario | Requests | Max concurrency | Output tok/s | Peak output tok/s | Total tok/s | Mean TTFT | Mean TPOT |
+|----------|----------|-----------------|--------------|-------------------|-------------|-----------|-----------|
+| Single stream | `4` | `1` | `41.45` | `45.00` | `138.17` | `1303.53 ms` | `22.70 ms` |
+| Two-way concurrency | `8` | `2` | `62.90` | `76.00` | `209.66` | `2900.49 ms` | `28.60 ms` |
+
+These numbers were measured with the same random workload shape:
+
+- input length: `2100`
+- output length: `900`
+- graph mode: `FULL_DECODE_ONLY`
+- capture sizes: `[1,2]`
 
 Targeted regression tests executed in the NPU environment:
 
